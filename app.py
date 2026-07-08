@@ -83,6 +83,141 @@ def post_discord(webhook_url, text):
             resp.read()
 
 
+def compact_text(value, limit=140):
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def compact_multiline(value, limit=1000):
+    text = "\n".join(" ".join(line.split()) for line in str(value or "").splitlines()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def escape_markdown_link_label(value):
+    return str(value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def markdown_link_url(value):
+    url = str(value or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+def format_news_line(news_item):
+    title = compact_text(news_item.get("title") or "新闻")
+    site = compact_text(news_item.get("site") or news_item.get("source") or "", limit=40)
+    if site and site.lower() not in title.lower():
+        title = f"{title} - {site}"
+    url = markdown_link_url(news_item.get("url"))
+    if url:
+        return f"- [{escape_markdown_link_label(title)}]({url})"
+    return f"- {title}"
+
+
+def money(value):
+    return f"{float(value):.2f}"
+
+
+def zone_text(row):
+    return f"{row['zone_low']:.2f}-{row['zone_high']:.2f} | 中轴 {row['level']:.0f}"
+
+
+def numbered_zones(rows, limit=4):
+    values = []
+    for idx, row in enumerate(rows[:limit], start=1):
+        values.append(f"{idx}. {zone_text(row)}")
+    return "\n".join(values) or "暂无"
+
+
+def short_event_line(event):
+    date = str(event.get("date", "")).strip()
+    time = str(event.get("time", "")).strip()
+    title = compact_text(event.get("title", ""), limit=80)
+    impact = str(event.get("impact", "")).strip()
+    prefix = " ".join(x for x in [date, time] if x)
+    suffix = f" | {impact}" if impact else ""
+    return f"{prefix} | {title}{suffix}".strip(" |")
+
+
+def status_color(status):
+    if status == "处于支撑区":
+        return 0x2ECC71
+    if status == "处于阻力区":
+        return 0xF39C12
+    if status == "跌破最近支撑":
+        return 0xE74C3C
+    if status == "突破最近阻力":
+        return 0x3498DB
+    return 0x95A5A6
+
+
+def field(name, value, inline=False):
+    return {
+        "name": name,
+        "value": compact_multiline(value, limit=1000) or "暂无",
+        "inline": inline,
+    }
+
+
+def build_stock_embed(mode, run_title, record, events, news):
+    ticker = record["ticker"]
+    meta = record["meta"]
+    nearest_support = record.get("nearest_support")
+    nearest_resistance = record.get("nearest_resistance")
+    description = "\n".join(
+        [
+            f"**状态:** {record['status']}",
+            f"**动作:** {record['action']}",
+        ]
+    )
+    fields = [
+        field(
+            "价格",
+            (
+                f"参考价 **{money(record['reference_price'])}**\n"
+                f"收盘 {money(record['close'])} | ATR14 {money(meta['atr14'])}\n"
+                f"数据日 {record['trade_date']}"
+            ),
+        ),
+        field(
+            "最近支撑",
+            (
+                f"**{zone_text(nearest_support)}**\n分数 {nearest_support['score']:.2f}"
+                if nearest_support
+                else "暂无"
+            ),
+            inline=True,
+        ),
+        field(
+            "最近阻力",
+            (
+                f"**{zone_text(nearest_resistance)}**\n分数 {nearest_resistance['score']:.2f}"
+                if nearest_resistance
+                else "暂无"
+            ),
+            inline=True,
+        ),
+        field("低吸区", numbered_zones(record["supports"]), inline=True),
+        field("高抛区", numbered_zones(record["resistances"]), inline=True),
+    ]
+    if events:
+        fields.append(field("未来一周事件", "\n".join(short_event_line(e) for e in events[:5])))
+    if news:
+        fields.append(field("近期新闻", "\n".join(format_news_line(n) for n in news[:3])))
+    return {
+        "title": f"{ticker} | {mode_title(mode)}",
+        "description": description,
+        "color": status_color(record["status"]),
+        "fields": fields[:25],
+        "footer": {"text": run_title},
+    }
+
+
 def event_applies(event, ticker):
     tickers = [str(x).upper() for x in event.get("tickers", ["ALL"])]
     return "ALL" in tickers or ticker.upper() in tickers
@@ -183,6 +318,7 @@ def render_stock(mode, stock, provider):
         "close": meta["close"],
         "reference_price": reference_price,
         "status": status,
+        "action": action,
         "levels": filtered,
         "nearest_support": nearest_support,
         "nearest_resistance": nearest_resistance,
@@ -251,9 +387,9 @@ def monitor(req: MonitorRequest):
             lines.append("")
             lines.append("近期新闻:")
             for n in news[:3]:
-                suffix = f" {n.get('url')}" if n.get("url") else ""
-                lines.append(f"- {n.get('title')}{suffix}")
+                lines.append(format_news_line(n))
         stock_text = "\n".join([run_title, "", *lines])
+        embed = build_stock_embed(req.mode, run_title, record, events, news)
         messages.append("\n".join(lines))
         for idx, chunk in enumerate(chunk_text(stock_text)):
             stock_message = {
@@ -262,7 +398,18 @@ def monitor(req: MonitorRequest):
                 "content": chunk,
             }
             stock_messages.append(stock_message)
-            if stock.discord_webhook_url:
+            if stock.discord_webhook_url and idx == 0:
+                webhook_messages.append(
+                    {
+                        **stock_message,
+                        "discord_webhook_url": stock.discord_webhook_url,
+                        "body": {
+                            "content": "",
+                            "embeds": [embed],
+                        },
+                    }
+                )
+            elif stock.discord_webhook_url:
                 webhook_messages.append(
                     {
                         **stock_message,
