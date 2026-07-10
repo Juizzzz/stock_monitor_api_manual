@@ -13,11 +13,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from model import ModelParams, classify_position, compact_zone, generate_levels, nearest_levels, normalize_prices
+from model import (
+    MIN_LEVEL_HISTORY_ROWS,
+    ModelParams,
+    classify_position,
+    compact_zone,
+    generate_levels,
+    nearest_levels,
+    normalize_prices,
+)
 from providers import get_provider
 
 
-app = FastAPI(title="Online Stock Point Monitor", version="1.1.0-manual-prices")
+app = FastAPI(title="Online Stock Point Monitor", version="1.2.0-adaptive-history")
 
 
 @app.exception_handler(Exception)
@@ -308,8 +316,14 @@ def render_stock(mode, stock, provider):
             raw_prices = provider.historical_prices(ticker)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"{ticker}: historical prices failed: {type(exc).__name__}: {exc}")
-    if len(raw_prices) < 220:
-        raise HTTPException(status_code=400, detail=f"{ticker}: not enough historical price rows ({len(raw_prices)} found)")
+    if len(raw_prices) < MIN_LEVEL_HISTORY_ROWS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{ticker}: level model needs at least {MIN_LEVEL_HISTORY_ROWS} historical rows "
+                f"({len(raw_prices)} found); keep this ticker in quote-only intraday alerts"
+            ),
+        )
     try:
         rows = normalize_prices(raw_prices)
     except Exception as exc:
@@ -321,7 +335,8 @@ def render_stock(mode, stock, provider):
     reference_price = stock.current_price or quote.get("price") or rows[-1]["Close"]
     params = model_params_from_stock(stock)
     levels, meta = generate_levels(rows, params=params)
-    filtered = [x for x in levels if x["score"] >= params.min_score]
+    effective_min_score = meta["effective_min_score"]
+    filtered = [x for x in levels if x["score"] >= effective_min_score]
     supports = [x for x in filtered if x["role"] == "support"]
     resistances = [x for x in filtered if x["role"] == "resistance"]
     status, action, nearest_support, nearest_resistance = classify_position(reference_price, supports, resistances)
@@ -329,7 +344,14 @@ def render_stock(mode, stock, provider):
     sell_zones = resistances[:4]
     lines = [
         f"【{ticker} {mode_title(mode)}】",
-        f"数据日: {meta['trade_date']}  收盘: {meta['close']:.2f}  参考价: {reference_price:.2f}  ATR14: {meta['atr14']:.2f}",
+        (
+            f"数据日: {meta['trade_date']}  收盘: {meta['close']:.2f}  "
+            f"参考价: {reference_price:.2f}  ATR14: {meta['atr14']:.2f}"
+        ),
+        (
+            f"历史模式: {meta['history_mode']}  样本: {meta['history_rows']}  "
+            f"点位置信度: {meta['level_confidence']}"
+        ),
         f"状态: {status}",
         f"建议: {action}",
         "",
@@ -356,6 +378,10 @@ def render_stock(mode, stock, provider):
         "resistances": sell_zones,
         "quote": quote,
         "meta": meta,
+        "history_mode": meta["history_mode"],
+        "history_rows": meta["history_rows"],
+        "level_confidence": meta["level_confidence"],
+        "available_indicators": meta["available_indicators"],
     }
     return lines, record
 
