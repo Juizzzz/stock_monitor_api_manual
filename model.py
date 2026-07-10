@@ -16,6 +16,34 @@ FIBS = [
 MA_WEIGHTS = [(20, 1.4), (50, 1.6), (100, 1.5), (200, 2.0)]
 HL_WEIGHTS = [(20, 1.3), (60, 1.6), (120, 1.8), (252, 2.0)]
 ATR_LADDER = [(1, 0.8), (2, 0.9), (3, 1.0)]
+MIN_LEVEL_HISTORY_ROWS = 20
+STANDARD_HISTORY_ROWS = 220
+
+
+def history_profile(row_count, configured_min_score=2.2):
+    """Return the model capabilities that are valid for the available history."""
+    if row_count >= STANDARD_HISTORY_ROWS:
+        mode = "standard"
+        confidence = "high"
+        effective_min_score = configured_min_score
+    elif row_count >= 60:
+        mode = "short_history"
+        confidence = "medium"
+        effective_min_score = min(configured_min_score, 1.8)
+    elif row_count >= MIN_LEVEL_HISTORY_ROWS:
+        mode = "minimal_history"
+        confidence = "low"
+        effective_min_score = min(configured_min_score, 1.4)
+    else:
+        mode = "quote_only"
+        confidence = "quote_only"
+        effective_min_score = configured_min_score
+    return {
+        "history_mode": mode,
+        "history_rows": row_count,
+        "level_confidence": confidence,
+        "effective_min_score": effective_min_score,
+    }
 
 
 @dataclass
@@ -136,7 +164,9 @@ def generate_levels(rows, cutoff=None, params=None):
     zone_half_width = max(params.min_zone_width, params.atr_zone_multiple * atr)
     start = max(0, i - params.lookback + 1)
     window = rows[start : i + 1]
+    profile = history_profile(len(window), params.min_score)
     raw_items = []
+    available_indicators = ["fib_listing_range"]
 
     swing_low = min(window, key=lambda x: x["Low"])
     swing_high = max(window, key=lambda x: x["High"])
@@ -148,16 +178,24 @@ def generate_levels(rows, cutoff=None, params=None):
         add_candidate(raw_items, value, source, weight, params)
 
     for n, weight in MA_WEIGHTS:
-        add_candidate(raw_items, current.get(f"MA{n}"), f"MA{n}", weight, params)
+        value = current.get(f"MA{n}")
+        if value is not None:
+            available_indicators.append(f"MA{n}")
+            add_candidate(raw_items, value, f"MA{n}", weight, params)
 
     for lb, weight in HL_WEIGHTS:
-        ww = rows[max(0, i - lb + 1) : i + 1]
+        if len(window) < lb:
+            continue
+        ww = rows[i - lb + 1 : i + 1]
+        available_indicators.append(f"{lb}d_high_low")
         add_candidate(raw_items, max(x["High"] for x in ww), f"{lb}d_high", weight, params)
         add_candidate(raw_items, min(x["Low"] for x in ww), f"{lb}d_low", weight, params)
 
     for kind, px, d in local_extrema(rows, start, i + 1, params.swing_radius):
         if abs(px - close) / close <= params.max_distance_from_close:
             add_candidate(raw_items, px, f"{kind}_{d}", 1.2, params)
+
+    available_indicators.extend(["ATR14", "local_extrema", "execution_grid"])
 
     for k, weight in ATR_LADDER:
         add_candidate(raw_items, close + k * atr, f"+{k}ATR14", weight, params)
@@ -208,6 +246,8 @@ def generate_levels(rows, cutoff=None, params=None):
         "swing_low": low_price,
         "swing_high_date": str(swing_high["Date"]),
         "swing_high": high_price,
+        **profile,
+        "available_indicators": available_indicators,
     }
     return levels, meta
 
