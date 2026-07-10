@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import urllib.parse
 import urllib.request
 from datetime import datetime
+from html import unescape
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -97,6 +100,15 @@ def compact_multiline(value, limit=1000):
     return text[: limit - 1].rstrip() + "…"
 
 
+def plain_news_title(value):
+    text = unescape(str(value or "新闻"))
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://|www\.)[^)]+\)", r"\1", text)
+    text = re.sub(r"\((?:https?://|www\.)[^)]+\)", "", text)
+    text = re.sub(r"(?:https?://|www\.)\S+", "", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return compact_text(text, limit=120) or "新闻"
+
+
 def escape_markdown_link_label(value):
     return str(value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
@@ -105,18 +117,36 @@ def markdown_link_url(value):
     url = str(value or "").strip()
     if not url.startswith(("http://", "https://")):
         return ""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.netloc == "news.google.com" and parsed.path.startswith("/rss/articles/"):
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
 
 def format_news_line(news_item):
-    title = compact_text(news_item.get("title") or "新闻")
+    title = plain_news_title(news_item.get("title") or "新闻")
     site = compact_text(news_item.get("site") or news_item.get("source") or "", limit=40)
     if site and site.lower() not in title.lower():
         title = f"{title} - {site}"
     url = markdown_link_url(news_item.get("url"))
     if url:
-        return f"- [{escape_markdown_link_label(title)}]({url})"
+        title = compact_text(title, limit=100)
+        link = f"[{escape_markdown_link_label(title)}]({url})"
+        if len(link) <= 950:
+            return f"- {link}"
     return f"- {title}"
+
+
+def news_fields(news):
+    result = []
+    for idx, item in enumerate(news[:3], start=1):
+        result.append(field(f"近期新闻 {idx}", format_news_line(item).removeprefix("- ")))
+    return result
+
+
+def format_news_text_lines(news):
+    return [format_news_line(item) for item in news[:3]]
+
 
 
 def money(value):
@@ -208,7 +238,7 @@ def build_stock_embed(mode, run_title, record, events, news):
     if events:
         fields.append(field("未来一周事件", "\n".join(short_event_line(e) for e in events[:5])))
     if news:
-        fields.append(field("近期新闻", "\n".join(format_news_line(n) for n in news[:3])))
+        fields.extend(news_fields(news))
     return {
         "title": f"{ticker} | {mode_title(mode)}",
         "description": description,
@@ -386,8 +416,7 @@ def monitor(req: MonitorRequest):
         if news:
             lines.append("")
             lines.append("近期新闻:")
-            for n in news[:3]:
-                lines.append(format_news_line(n))
+            lines.extend(format_news_text_lines(news))
         stock_text = "\n".join([run_title, "", *lines])
         embed = build_stock_embed(req.mode, run_title, record, events, news)
         messages.append("\n".join(lines))
